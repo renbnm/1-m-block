@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 #include <signal.h>
 #include <sys/socket.h>
