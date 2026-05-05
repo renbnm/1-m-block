@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <chrono>
 #include <errno.h>
 #include <linux/netfilter.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
@@ -48,8 +49,8 @@ static string normalize_host(string host) {
 	pos = host.find('#');
 	if (pos != string::npos) host = host.substr(0, pos);
 
-	for (char& c : host) {
-		c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+	for (size_t i = 0; i < host.size(); i++) {
+		host[i] = static_cast<char>(tolower(static_cast<unsigned char>(host[i])));
 	}
 
 	if (!host.empty() && host.back() == '.') {
@@ -75,6 +76,34 @@ static string normalize_host(string host) {
 	host = host.substr(start, end - start);
 
 	return host;
+}
+
+static bool is_blocked_host(const string& input_host) {
+	string host = normalize_host(input_host);
+	if (host.empty()) return false;
+
+	string current = host;
+	while (true) {
+		if (blocked_sites.find(current) != blocked_sites.end()) return true;
+
+		size_t dot = current.find('.');
+		if (dot == string::npos) break;
+		current = current.substr(dot + 1);
+	}
+
+	if (host.rfind("www.", 0) == 0 && host.size() > 4) {
+		current = host.substr(4);
+
+		while (true) {
+			if (blocked_sites.find(current) != blocked_sites.end()) return true;
+
+			size_t dot = current.find('.');
+			if (dot == string::npos) break;
+			current = current.substr(dot + 1);
+		}
+	}
+
+	return false;
 }
 
 static void cleanup_rule() {
@@ -147,7 +176,6 @@ static int callback(struct nfq_q_handle* qh, struct nfgenmsg*, struct nfq_data* 
 	}
 
 	string http_data(payload, payload_len);
-	string host;
 
 	auto ieq = [](char a, char b) {
 		return tolower(static_cast<unsigned char>(a)) ==
@@ -190,42 +218,22 @@ static int callback(struct nfq_q_handle* qh, struct nfgenmsg*, struct nfq_data* 
 		return nfq_set_verdict(qh, id, NF_ACCEPT, 0, nullptr);
 	}
 
-	host = normalize_host(http_data.substr(start, end - start));
+	string host = normalize_host(http_data.substr(start, end - start));
 	if (host.empty()) {
 		return nfq_set_verdict(qh, id, NF_ACCEPT, 0, nullptr);
 	}
 
-	string current = host;
-	while (true) {
-		if (blocked_sites.find(current) != blocked_sites.end()) {
-			cout << "[BLOCK] " << host << '\n';
-			return nfq_set_verdict(qh, id, NF_DROP, 0, nullptr);
-		}
-
-		size_t dot = current.find('.');
-		if (dot == string::npos) break;
-		current = current.substr(dot + 1);
-	}
-
-	if (host.rfind("www.", 0) == 0 && host.size() > 4) {
-		current = host.substr(4);
-
-		while (true) {
-			if (blocked_sites.find(current) != blocked_sites.end()) {
-				cout << "[BLOCK] " << host << '\n';
-				return nfq_set_verdict(qh, id, NF_DROP, 0, nullptr);
-			}
-
-			size_t dot = current.find('.');
-			if (dot == string::npos) break;
-			current = current.substr(dot + 1);
-		}
+	if (is_blocked_host(host)) {
+		cout << "[BLOCK] " << host << '\n';
+		return nfq_set_verdict(qh, id, NF_DROP, 0, nullptr);
 	}
 
 	return nfq_set_verdict(qh, id, NF_ACCEPT, 0, nullptr);
 }
 
 int main(int argc, char* argv[]) {
+	using namespace std::chrono;
+
 	if (argc != 2) {
 		cerr << "syntax : 1m-block <site list file>\n";
 		cerr << "sample : 1m-block top-1m.csv\n";
@@ -244,7 +252,10 @@ int main(int argc, char* argv[]) {
 	}
 
 	string line;
+	string measured_host;
 	size_t loaded_lines = 0;
+
+	auto load_begin = steady_clock::now();
 
 	while (getline(file, line)) {
 		size_t start = 0;
@@ -266,6 +277,10 @@ int main(int argc, char* argv[]) {
 		host = normalize_host(host);
 		if (host.empty()) continue;
 
+		if (measured_host.empty()) {
+			measured_host = host;
+		}
+
 		blocked_sites.insert(host);
 
 		if (host.rfind("www.", 0) == 0 && host.size() > 4) {
@@ -275,8 +290,42 @@ int main(int argc, char* argv[]) {
 		loaded_lines++;
 	}
 
+	auto load_end = steady_clock::now();
+
 	cout << "[*] loaded lines: " << loaded_lines << '\n';
 	cout << "[*] loaded hosts in set: " << blocked_sites.size() << '\n';
+	cout << "[*] load time(ms): "
+	     << duration_cast<milliseconds>(load_end - load_begin).count() << '\n';
+
+	if (!measured_host.empty()) {
+		auto search_begin = steady_clock::now();
+		bool found = is_blocked_host(measured_host);
+		auto search_end = steady_clock::now();
+
+		cout << "[*] search host: " << measured_host << '\n';
+		cout << "[*] search result: " << (found ? "found" : "not found") << '\n';
+		cout << "[*] single search time(ns): "
+		     << duration_cast<nanoseconds>(search_end - search_begin).count() << '\n';
+
+		volatile int dummy = 0;
+		const int repeat = 1000000;
+
+		auto repeat_begin = steady_clock::now();
+		for (int i = 0; i < repeat; i++) {
+			if (is_blocked_host(measured_host)) dummy++;
+		}
+		auto repeat_end = steady_clock::now();
+
+		long long total_ns =
+			duration_cast<nanoseconds>(repeat_end - repeat_begin).count();
+
+		cout << "[*] repeated search count: " << repeat << '\n';
+		cout << "[*] repeated search total(ns): " << total_ns << '\n';
+		cout << "[*] repeated search avg(ns): " << (total_ns / repeat) << '\n';
+	}
+
+	cout << "[*] pid: " << getpid() << '\n';
+	cout << "[*] check memory with: top -p " << getpid() << '\n';
 
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
